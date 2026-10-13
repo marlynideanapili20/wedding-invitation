@@ -2435,6 +2435,8 @@
     color:#a24b45; margin-top:6px; letter-spacing:0.3px;
   }
   #continuation .form-field.field-error .field-error-msg{ display:block; }
+  /* Sending error (Wedly RSVP): same type as the field errors, shown only after a failed send */
+  #continuation .rsvp-send-error.shown{ display:block; margin-top:10px; }
   #continuation .radio-opt{
     display:flex; align-items:center; gap:8px;
     font-family:'Libre Baskerville', serif; font-size:clamp(13px, 3.3vw, 14px); margin-bottom:8px;
@@ -3340,7 +3342,7 @@
       <div class="rsvp-form-card reveal">
         <div class="form-field" id="rsvp-name-field">
           <label for="rsvp-name">Full Name</label>
-          <input type="text" id="rsvp-name" placeholder="Enter your full name" required>
+          <input type="text" id="rsvp-name" placeholder="Enter your full name" maxlength="121" required>
           <p class="field-error-msg">Please enter your name.</p>
         </div>
         <div class="form-field" id="rsvp-attend-field">
@@ -3351,13 +3353,14 @@
         </div>
         <div class="form-field">
           <label for="rsvp-message">Leave Us a Message (Optional)</label>
-          <textarea id="rsvp-message" placeholder="Share your wishes, prayers, advice, or a message for us."></textarea>
+          <textarea id="rsvp-message" placeholder="Share your wishes, prayers, advice, or a message for us." maxlength="500"></textarea>
         </div>
         <div class="swipe-send-track" id="rsvp-send-track">
           <div class="swipe-send-fill" id="rsvp-send-fill"></div>
           <div class="swipe-send-label">Swipe Right to Send Your RSVP &#10084;&#65039;</div>
           <div class="swipe-send-thumb" id="rsvp-send-thumb">&#10084;&#65039;</div>
         </div>
+        <p class="field-error-msg rsvp-send-error" id="rsvp-send-error" role="alert" aria-live="assertive"></p>
       </div>
     </div>
 
@@ -6094,7 +6097,38 @@
       };
     }
 
+    /* ---- Wedly RSVP. Each reply is sent to the couple's Wedly
+       (production) as JSON. The thank-you card is shown ONLY after
+       Wedly confirms the reply ("received" or "already_received");
+       anything else keeps the form, explains, and lets the guest
+       swipe again. The address carries Wedly's public connection key
+       (not a secret: it only lets this website send replies). ---- */
+    var WEDLY_RSVP_ENDPOINT = 'https://wedly-wedly2.vercel.app/api/rsvp/eymf3grujvr5ezqkywtcprm9';
+    var RSVP_TIMEOUT_MS = 15000;   // give up waiting for Wedly after 15 s
+    var CEREMONY_MS = 2650;        // the full heart-flight + envelope-seal sequence
+    var MIN_FAIL_MS = 700;         // a fast failure never just flickers the overlay
+    var RSVP_ERRORS = {
+      rate_limited: 'Too many tries. Please wait a few minutes, then swipe again.',
+      unavailable: 'RSVPs aren’t being accepted right now. Please contact Marlyn or Tihomir.',
+      generic: 'We couldn’t send your RSVP just now. Please check your connection and swipe again.'
+    };
+    var messageField = document.getElementById('rsvp-message');
+    var sendError = document.getElementById('rsvp-send-error');
+    var sending = false;
+
+    function showSendError(text){
+      if(!sendError) return;
+      sendError.textContent = text;
+      sendError.classList.add('shown');
+    }
+    function clearSendError(){
+      if(!sendError) return;
+      sendError.textContent = '';
+      sendError.classList.remove('shown');
+    }
+
     var sendSlider = makeSwipeTrack('rsvp-send-track', 'rsvp-send-thumb', 'rsvp-send-fill', function(){
+      if(sending) return; // one reply at a time
       var attending = document.querySelector('input[name="rsvp-attend"]:checked');
       var nameOk = nameField && nameField.value.trim();
       var attendOk = !!attending;
@@ -6111,8 +6145,81 @@
       if(document.activeElement && typeof document.activeElement.blur === 'function'){
         document.activeElement.blur();
       }
-      playSendCeremony();
+      clearSendError();
+      submitRsvp(attending.value === 'yes');
     });
+
+    /* Wedly's answer as one word: "received", "already_received",
+       "invalid", "unavailable", "rate_limited" or "error" (also used for
+       a network failure, a refused website, a timeout or an unreadable
+       answer). Never rejects. */
+    function sendToWedly(payload){
+      return new Promise(function(resolve){
+        var settled = false;
+        var controller = (typeof AbortController === 'function') ? new AbortController() : null;
+        function finish(status){ if(!settled){ settled = true; clearTimeout(timer); resolve(status); } }
+        var timer = setTimeout(function(){
+          if(controller){ try{ controller.abort(); }catch(e){} }
+          finish('error');
+        }, RSVP_TIMEOUT_MS);
+        var options = {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          mode: 'cors',
+          credentials: 'omit',
+          cache: 'no-store'
+        };
+        if(controller) options.signal = controller.signal;
+        var request;
+        try{ request = fetch(WEDLY_RSVP_ENDPOINT, options); }
+        catch(e){ finish('error'); return; }
+        request.then(function(response){
+          return response.json().then(function(body){
+            var status = body && typeof body.status === 'string' ? body.status : '';
+            if(status === 'received' || status === 'already_received'){
+              finish(response.ok && body.ok === true ? status : 'error');
+            } else if(status === 'invalid' || status === 'unavailable' || status === 'rate_limited'){
+              finish(status);
+            } else {
+              finish('error');
+            }
+          }, function(){ finish('error'); });
+        }, function(){ finish('error'); });
+      });
+    }
+
+    function submitRsvp(attendingYes){
+      sending = true;
+      var payload = {
+        name: nameField.value.trim(),
+        attendance: attendingYes ? 'attending' : 'declined',
+        website: ''
+      };
+      var message = messageField ? messageField.value.trim() : '';
+      if(message) payload.message = message;
+
+      var ceremony = startSendCeremony();
+      sendToWedly(payload).then(function(status){
+        if(status === 'received' || status === 'already_received'){
+          // Let the full ceremony play, then reveal the thank-you card
+          ceremony.whenElapsed(CEREMONY_MS, function(){
+            ceremony.close();
+            sending = false;
+            finishRsvp(status === 'already_received');
+          });
+        } else {
+          ceremony.whenElapsed(MIN_FAIL_MS, function(){
+            ceremony.close();
+            sending = false;
+            if(sendSlider) sendSlider.reset();
+            showSendError(status === 'rate_limited' ? RSVP_ERRORS.rate_limited
+              : status === 'unavailable' ? RSVP_ERRORS.unavailable
+              : RSVP_ERRORS.generic);
+          });
+        }
+      });
+    }
 
     if(nameField){
       nameField.addEventListener('input', function(){
@@ -6125,24 +6232,38 @@
 
     /* ---- Ceremonial send: heart flies, envelope seals, brief
        pause, then the confirmation is revealed in place. ---- */
-    function playSendCeremony(){
+    /* Same sequence and timings as before. It now stays on the sealed
+       envelope ("Sending your RSVP…") until Wedly has answered, and
+       closes without a thank-you card if the reply wasn't received. */
+    function startSendCeremony(){
       var overlay = document.getElementById('send-ceremony');
-      if(!overlay){ finishRsvp(); return; }
-      overlay.classList.add('on');
-      requestAnimationFrame(function(){ overlay.classList.add('fly'); });
-      setTimeout(function(){ overlay.classList.add('envelope-in'); }, 900);
-      setTimeout(function(){ overlay.classList.add('envelope-sealed'); }, 1500);
-      setTimeout(function(){
-        overlay.classList.remove('on', 'fly', 'envelope-in', 'envelope-sealed');
-        finishRsvp();
-      }, 2650);
+      var started = Date.now();
+      var timers = [];
+      if(overlay){
+        overlay.classList.add('on');
+        requestAnimationFrame(function(){ if(overlay.classList.contains('on')) overlay.classList.add('fly'); });
+        timers.push(setTimeout(function(){ overlay.classList.add('envelope-in'); }, 900));
+        timers.push(setTimeout(function(){ overlay.classList.add('envelope-sealed'); }, 1500));
+      }
+      return {
+        whenElapsed: function(ms, fn){
+          timers.push(setTimeout(fn, Math.max(0, ms - (Date.now() - started))));
+        },
+        close: function(){
+          timers.forEach(clearTimeout);
+          if(overlay) overlay.classList.remove('on', 'fly', 'envelope-in', 'envelope-sealed');
+        }
+      };
     }
 
-    function finishRsvp(){
+    function finishRsvp(alreadyReceived){
       var attending = document.querySelector('input[name="rsvp-attend"]:checked');
       var attendingYes = !attending || attending.value === 'yes';
       var msg = document.getElementById('rsvp-confirm-message');
-      if(msg){
+      if(msg && alreadyReceived){
+        // Wedly keeps a guest's first answer, so don't repeat today's choice back
+        msg.textContent = 'We already have your RSVP — thank you! If you need to change it, please contact Marlyn or Tihomir directly.';
+      } else if(msg){
         msg.textContent = attendingYes ?
           'Thank you for saying \u201cyes\u201d to celebrating with us. We can\u2019t wait to welcome you on Wednesday, January 27, 2027, at 3:00 PM, as we begin this new chapter surrounded by the people we love most.' :
           'Although we\u2019ll miss celebrating with you in person, we\u2019re deeply grateful for your love, support, and warm wishes as we begin this new chapter together.';
